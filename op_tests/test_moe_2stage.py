@@ -31,6 +31,13 @@ from aiter.aot.flydsl.common import fail_on_aot_cache_miss
 from aiter.ops.flydsl.moe_common import GateMode
 import aiter.ops.flydsl.moe_kernels as _aiter_mk
 
+try:
+    from tuned_op_bench_utils import append_tuned_op_bench_rows
+except ModuleNotFoundError as e:
+    if e.name != "tuned_op_bench_utils":
+        raise
+    from op_tests.tuned_op_bench_utils import append_tuned_op_bench_rows
+
 
 from aiter.ops.shuffle import (
     shuffle_weight,
@@ -64,6 +71,7 @@ def test_fmoe(
     doweight_stage1=False,
     hidden_pad=0,
     intermediate_pad=0,
+    bias=False,
     preshuffle=True,
     strict_accuracy=True,
     check_aot_cache=True,
@@ -80,16 +88,29 @@ def test_fmoe(
         if intermediate_pad != 0:
             w1[:, -intermediate_pad:, :] = 0
             w1[:, inter_dim - intermediate_pad : inter_dim, :] = 0
-        exp_bias1 = torch.clamp(torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0)
+        if bias:
+            exp_bias1 = torch.clamp(
+                torch.randn((E, inter_dim * 2), dtype=dtype), -1.0, 1.0
+            )
+        else:
+            exp_bias1 = None
     else:
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
-        exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
+        if bias:
+            exp_bias1 = torch.clamp(
+                torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0
+            )
+        else:
+            exp_bias1 = None
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
     if intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
     if hidden_pad != 0:
         w2[:, -hidden_pad:, :] = 0
-    exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
+    if bias:
+        exp_bias2 = torch.clamp(torch.randn((E, model_dim), dtype=dtype), -1.0, 1.0)
+    else:
+        exp_bias2 = None
     if AITER_MOE_EXPERT_BALANCE:
         score = torch.zeros((token, E), dtype=dtype)
         start_col = 0
@@ -179,22 +200,14 @@ def test_fmoe(
     else:
         a1_qt, a1_scale = torch_quant(input, quant_dtype=AQDType)
 
-    # bias dtype convert
-    if (
-        qType == aiter.QuantType.per_1x32
-        and (AQDType in [dtypes.bf16, dtypes.fp16, dtypes.fp8])
-        and (WQDType == dtypes.fp4x2)
-    ):  # a16w4
+    # bias dtype convert: `bias` flag (from csv) is the source of truth. When
+    # set, cast to fp32 (kernel ABI). Otherwise keep both references disabled.
+    if exp_bias1 is None:
+        exp_bias1_aiter = None
+        exp_bias2_aiter = None
+    else:
         exp_bias1_aiter = exp_bias1.to(dtypes.fp32)
         exp_bias2_aiter = exp_bias2.to(dtypes.fp32)
-    elif (
-        qType == aiter.QuantType.per_1x32 and WQDType == dtypes.i4x2
-    ):  # a16wi4: no bias
-        exp_bias1_aiter = exp_bias1 = None
-        exp_bias2_aiter = exp_bias2 = None
-    else:
-        exp_bias1_aiter = exp_bias1 = None
-        exp_bias2_aiter = exp_bias2 = None
 
     # pre-shuffle
     w1_scale_aiter = w1_scale
@@ -279,6 +292,7 @@ def test_fmoe(
                 getattr(w1_qt_aiter, "is_shuffled", False)
                 or getattr(w2_qt_aiter, "is_shuffled", False),
                 gateMode,
+                bias=exp_bias1_aiter is not None,
             )
             if metadata.fuse_quant == "fp4":
                 # Fused Swiglu MXFP4 quantizes the f32 activation directly.
@@ -607,6 +621,7 @@ def _row_to_kwargs(row):
         doweight_stage1=dtypes.str2bool(str(row["doweight_stage1"])),
         hidden_pad=0,
         intermediate_pad=0,
+        bias=dtypes.str2bool(str(row.get("bias", "False"))),
         preshuffle=True,
     )
 
@@ -760,6 +775,7 @@ def _iter_legacy_cases():
                         aiter.ActivationType.Swiglu,
                         hidden_pad=hidden_pad,
                         intermediate_pad=intermediate_pad,
+                        bias=True,
                     ), extras
         elif triple == _PER1X32_FP4_FP4:
             for preshuffle in args.preshuffle:
@@ -818,6 +834,28 @@ if not args.no_legacy:
     _case_iters.append(_iter_legacy_cases())
 case_iter = itertools.chain(*_case_iters)
 
+_csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")
+
+
+def _write_bench_csv(rows):
+    if not _csv_out or len(rows) == 0:
+        return
+    row = rows[-1]
+    if row.get("model") == "legacy":
+        return
+    written = append_tuned_op_bench_rows(
+        _csv_out,
+        [row],
+        op_name="moe_2stage",
+        metric_cols=("us",),
+        default_impl="fused_moe",
+    )
+    if written:
+        aiter.logger.info(
+            "moe_2stage: appended %d tuned op bench row(s) to %s", written, _csv_out
+        )
+
+
 df = []
 seen = 0
 for kwargs, extras in case_iter:
@@ -853,6 +891,7 @@ for kwargs, extras in case_iter:
         continue
     ret.update(extras)
     df.append(ret)
+    _write_bench_csv(df)
 
 aiter.logger.info(
     "moe_2stage: scanned %d cases, recorded %d results (skipped %d)",

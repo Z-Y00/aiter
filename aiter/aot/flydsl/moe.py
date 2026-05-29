@@ -38,6 +38,7 @@ from aiter.aot.flydsl.common import (
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.moe_kernels import (
     _get_compiled_silu_fused,
+    _ptr_view_safe,
     _run_compiled,
     _s1_args_fp4,
     _s1_args_std,
@@ -71,6 +72,15 @@ def _row_swiglu_limit(row: dict[str, str]) -> float:
     return _parse_optional_float(row.get("swiglu_limit"), "swiglu_limit") or 0.0
 
 
+def _parse_bool(value: str) -> bool:
+    value = value.strip()
+    if value in ("True", "1"):
+        return True
+    if value in ("False", "0"):
+        return False
+    raise ValueError(f"unsupported bool value: {value!r}")
+
+
 def parse_csv(csv_path: str):
     """Parse the CSV and return a list of unique compile jobs.
 
@@ -101,23 +111,8 @@ def parse_csv(csv_path: str):
                 if act_type.strip().split(".")[-1].lower() == "swiglu"
                 else "silu"
             )
-            q_type = row.get("q_type", "")
-            dtype = row.get("dtype", "")
-            q_dtype_w = row.get("q_dtype_w", "")
-            q_dtype_a = row.get("q_dtype_a", "")
             swiglu_limit = _row_swiglu_limit(row)
-            # Match the RT condition in fused_moe.py / test_moe_2stage.py:
-            #   _needs_swiglu_bias_support(dtype, q_type) and q_dtype_w == fp4x2
-            #   AND the caller actually passes a bias tensor (bias1 is not None).
-            # Bias is passed only when q_dtype_a is fp8 or bf16 (NOT fp4x2).
-            # For pure a4w4 models (q_dtype_a == fp4x2), bias1=None regardless of
-            # activation type (Silu or Swiglu), so enable_bias=False.
-            enable_bias = (
-                q_type.strip().split(".")[-1] == "per_1x32"
-                and dtype in ("torch.bfloat16", "torch.float16")
-                and "float4_e2m1fn_x2" in q_dtype_w
-                and "float4_e2m1fn_x2" not in q_dtype_a  # fp8/bf16 activation only
-            )
+            enable_bias_options = [_parse_bool(row.get("bias", "False"))]
 
             # Detect stage1's fuse_quant from kernel suffix to align stage2's
             # a2_scale shape with what runtime actually passes.
@@ -134,40 +129,43 @@ def parse_csv(csv_path: str):
                 if not name or not name.startswith("flydsl_"):
                     continue
 
-                job = {
-                    "kernel_name": name,
-                    "model_dim": model_dim,
-                    "inter_dim": inter_dim,
-                    "experts": experts,
-                    "topk": topk,
-                    "doweight_stage1": doweight_stage1,
-                    "cu_num": cu_num,
-                    "act": act,
-                    "enable_bias": enable_bias,
-                }
                 params = get_flydsl_kernel_params(name)
                 if params is None:
                     print(f"  [WARN] Unknown kernel name: {name}, skipping")
                     continue
 
-                job["token_num"] = token
-                job["block_m"] = block_m
-                job["swiglu_limit"] = swiglu_limit
-                # Stage2 needs to know whether stage1 fuses fp4/fp8 quant —
-                # this changes the shape of a2_scale (sorted scale buffer
-                # vs separate quant call output).
-                if params["stage"] == 2:
-                    job["stage1_fuse_quant"] = (
-                        stage1_out_dtype if stage1_out_dtype in ("fp4", "fp8") else None
-                    )
+                for enable_bias in enable_bias_options:
+                    job = {
+                        "kernel_name": name,
+                        "model_dim": model_dim,
+                        "inter_dim": inter_dim,
+                        "experts": experts,
+                        "topk": topk,
+                        "doweight_stage1": doweight_stage1,
+                        "cu_num": cu_num,
+                        "act": act,
+                        "enable_bias": enable_bias,
+                        "token_num": token,
+                        "block_m": block_m,
+                        "swiglu_limit": swiglu_limit,
+                    }
+                    # Stage2 needs to know whether stage1 fuses fp4/fp8 quant —
+                    # this changes the shape of a2_scale (sorted scale buffer
+                    # vs separate quant call output).
+                    if params["stage"] == 2:
+                        job["stage1_fuse_quant"] = (
+                            stage1_out_dtype
+                            if stage1_out_dtype in ("fp4", "fp8")
+                            else None
+                        )
 
-                full_job = {**job, **params}
-                key = job_identity(full_job)
-                if key in seen:
-                    continue
-                seen.add(key)
+                    full_job = {**job, **params}
+                    key = job_identity(full_job)
+                    if key in seen:
+                        continue
+                    seen.add(key)
 
-                jobs.append(full_job)
+                    jobs.append(full_job)
 
     return jobs
 
@@ -568,25 +566,36 @@ def _precompile_to_cache(
                 else:
                     quant_mode = "fp4"
                     gui_layout = False
+                use_splitk_bias = enable_bias and _is_splitk
+                topk_ids_arg = (
+                    torch.zeros(tokens * topk, device=dev, dtype=torch.int32)
+                    if use_splitk_bias
+                    else sorted_token_ids.view(-1)
+                )
+                bias_arg = (
+                    bias.contiguous().view(-1)
+                    if use_splitk_bias
+                    else torch.empty(0, device=dev, dtype=torch.float32)
+                )
                 silu_fused = _get_compiled_silu_fused(
                     inter_dim,
                     topk,
                     quant_mode,
                     gui_layout=gui_layout,
                     act=act,
-                    enable_bias=False,
+                    enable_bias=use_splitk_bias,
                     swiglu_limit=swiglu_limit,
                 )
                 _run_compiled(
                     silu_fused,
                     (
-                        tmp_out.view(-1, inter_dim * 2),
-                        out.view(-1).view(torch.uint8),
-                        out_scale_sorted_flat,
-                        sorted_token_ids,
-                        num_valid_ids,
-                        sorted_token_ids.view(-1),
-                        torch.empty(0, device=dev, dtype=torch.float32),
+                        _ptr_view_safe(tmp_out.view(-1, inter_dim * 2)),
+                        _ptr_view_safe(out.view(-1).view(torch.uint8)),
+                        _ptr_view_safe(out_scale_sorted_flat),
+                        _ptr_view_safe(sorted_token_ids),
+                        _ptr_view_safe(num_valid_ids),
+                        _ptr_view_safe(topk_ids_arg),
+                        _ptr_view_safe(bias_arg),
                         tokens,
                         sorted_token_ids.shape[0],
                         0,
