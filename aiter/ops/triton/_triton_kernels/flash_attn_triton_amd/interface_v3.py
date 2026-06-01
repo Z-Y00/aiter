@@ -2,6 +2,7 @@ import torch
 from typing import Literal, Optional, Tuple
 from .fwd_prefill import attention_forward_prefill_triton_impl
 from .fwd_decode import attention_forward_decode_triton_impl
+from .fwd_decode import get_persistent_decode_buffer
 from .bwd import attention_backward_triton_impl
 from .utils import (
     DEBUG,
@@ -217,14 +218,17 @@ def fwd(
         # NOTE: Using types that are lower precision than float32 such as bfloat16 for fp8 causes mismatches on a small set of tests.
         out_dtype = torch.float32 if is_fp8([q, k, v]) else q.dtype
         if layout == "bshd":
-            out = torch.zeros(
-                q.shape[0],
-                q.shape[1],
-                q.shape[2],
-                v.shape[-1],
-                dtype=out_dtype,
-                device=q.device,
+            # Persistent (shape-keyed) auto-allocated output so the decode
+            # kernel's output has a stable device address across CUDA/HIP graph
+            # capture and replay. Callers needing an independent output buffer
+            # can pass `out=` explicitly (this branch only runs when out is None).
+            out = get_persistent_decode_buffer(
+                "decode_out",
+                (q.shape[0], q.shape[1], q.shape[2], v.shape[-1]),
+                out_dtype,
+                q.device,
             )
+            out.zero_()
         elif layout == "thd":
             out = torch.zeros(
                 q.shape[0], q.shape[1], v.shape[-1], dtype=out_dtype, device=q.device
@@ -258,11 +262,13 @@ def fwd(
                 f"Using Decode Triton implementation (cache_seqlens={seqused_k is not None}, k_new={k_new is not None}, v_new={v_new is not None}, kv_batch_idx={kv_batch_idx is not None})"
             )
 
-        # Create softmax_lse tensor for decode - always exact shape (B, Hq, Sq)
+        # Create softmax_lse tensor for decode - always exact shape (B, Hq, Sq).
+        # Persistent (shape-keyed) for CUDA/HIP graph capture/replay safety.
         batch, seqlen_q, nheads_q, _ = q.shape
-        softmax_lse = torch.zeros(
-            (batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32
+        softmax_lse = get_persistent_decode_buffer(
+            "softmax_lse", (batch, nheads_q, seqlen_q), torch.float32, q.device
         )
+        softmax_lse.zero_()
 
         # Decode only supports bshd layout
         assert layout == "bshd", f"decode requires bshd layout, got {layout}"

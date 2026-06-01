@@ -29,6 +29,27 @@ FWD_DECODE_AUTOTUNE_KEYS = [
 MAX_BLOCK_M = 64
 
 
+# Persistent split-K decode scratch buffers, keyed by (name, shape, dtype,
+# device). The decode path otherwise allocates `out_splitk` / `metadata` (and
+# the auto-allocated output / softmax_lse) with a fresh torch.empty on every
+# call. When the decode is captured into a CUDA/HIP graph, those fresh
+# allocations get recorded into the graph and then freed; the caching allocator
+# later recycles their addresses, so on graph replay the kernels read/write
+# reused memory -> "illegal memory access". Reusing persistent buffers keyed by
+# shape gives stable device addresses across capture and replay.
+_PERSISTENT_DECODE_BUFFERS: dict = {}
+
+
+def get_persistent_decode_buffer(name, shape, dtype, device):
+    shape = tuple(int(x) for x in shape)
+    key = (name, shape, dtype, str(device))
+    buf = _PERSISTENT_DECODE_BUFFERS.get(key)
+    if buf is None:
+        buf = torch.empty(shape, dtype=dtype, device=device)
+        _PERSISTENT_DECODE_BUFFERS[key] = buf
+    return buf
+
+
 def get_fwd_decode_configs(mode: AutotuneMode):
     """
     Returns configs for both the splitK kernel and reduce kernel.
@@ -1164,20 +1185,22 @@ def attention_forward_decode_triton_impl(
         )
 
     # create intermediate tensors
-    out_splitk = torch.empty(
+    out_splitk = get_persistent_decode_buffer(
+        "out_splitk",
         [
             batch_size * n_group_q * heads_per_group_q,
             split_k,
             seqlen_q_ceil,
             dim_padded,
         ],
-        dtype=torch.float32,
-        device=q.device,
+        torch.float32,
+        q.device,
     )
-    metadata = torch.empty(
+    metadata = get_persistent_decode_buffer(
+        "metadata",
         [batch_size * n_group_q * heads_per_group_q, 2, split_k, seqlen_q_ceil],
-        dtype=torch.float32,
-        device=q.device,
+        torch.float32,
+        q.device,
     )
 
     # Validate pre-allocated softmax_lse tensor
